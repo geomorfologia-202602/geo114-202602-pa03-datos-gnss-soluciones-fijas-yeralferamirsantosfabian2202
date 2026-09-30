@@ -1,0 +1,927 @@
+---
+title: "Prácticas de aula 3 (PA03). Procesa datos GNSS y obtén soluciones fijas"
+subtitle: "Geomorfología (GEO-114) · Universidad Autónoma de Santo Domingo (UASD)"
+author: "Yeral Feramir Santos Fabian · Matrícula 100758838"
+date: "2026-10-05"
+lang: es
+toc-title: "Índice"
+output:
+  bookdown::pdf_document2:
+    latex_engine: pdflatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    keep_tex: false
+bibliography: references.bib
+csl: apa.csl
+citeproc: true
+link-citations: true
+colorlinks: true
+linkcolor: blue
+citecolor: blue
+urlcolor: blue
+fontsize: 11pt
+geometry: margin=2.5cm
+linestretch: 1.1
+editor_options:
+  chunk_output_type: console
+header-includes:
+  - |
+    \usepackage[utf8]{inputenc}
+    \usepackage[T1]{fontenc}
+    \usepackage{lmodern}
+    \usepackage{microtype}
+    \usepackage{float}
+    \floatplacement{figure}{H}
+    \usepackage{booktabs}
+    \usepackage{array}
+    \usepackage{multirow}
+    \usepackage{colortbl}
+    \usepackage{makecell}
+    \usepackage{threeparttable}
+    \usepackage{threeparttablex}
+    \usepackage{caption}
+    \captionsetup[table]{name=Tabla}
+    \captionsetup[figure]{name=Figura}
+    \usepackage{fvextra}
+    \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+    \fvset{breaklines=true}
+    \let\PAoldmaketitle\maketitle
+    \renewcommand{\maketitle}{\PAoldmaketitle\clearpage}
+---
+
+<!--
+NOTAS (no se renderizan):
+1. Necesita apa.csl, references.bib y _bookdown.yml en la misma carpeta que este .Rmd.
+2. Las tablas y figuras de dispersión se calculan solas si existen los .pos en gnss/ppk/ con los
+   nombres: rover_ublox_fijo.pos, rover_ublox_epocas.pos, rover_unicore_fijo.pos, rover_unicore_epocas.pos.
+   Si no existen, se usan los valores suministrados (100 % FLOAT, 632 y 635 épocas, diferencias entre medias).
+3. Tejer solo a PDF: rmarkdown::render("PA03_GNSS.Rmd", output_format = "bookdown::pdf_document2")
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  eval = TRUE,
+  comment = "#>",
+  tidy = FALSE,
+  out.width = "100%",
+  fig.align = "center",
+  fig.pos = "H",
+  fig.width = 7,
+  fig.height = 4,
+  dev = "png",
+  dpi = 150,
+  fig.retina = 2
+)
+suppressPackageStartupMessages({
+  library(knitr)
+  library(kableExtra)
+  library(ggplot2)
+})
+```
+
+```{r funciones-aux, include=FALSE}
+# ---- Utilidades generales -------------------------------------------------
+# Tabla estándar: kbl() + kable_styling() con booktabs = TRUE
+# (Evitar celdas que EMPIECEN por "[" en la PRIMERA columna: en LaTeX chocan con "\\[")
+kbl_pa <- function(df, caption, widths = NULL, wide = FALSE, font_size = 9, ...) {
+  k <- kbl(df, booktabs = TRUE, caption = caption, escape = TRUE,
+           linesep = "", ...)
+  k <- kable_styling(
+    k,
+    latex_options = c("hold_position", "striped", if (wide) "scale_down"),
+    position = "center", full_width = FALSE, font_size = font_size
+  )
+  if (!is.null(widths)) {
+    for (i in seq_along(widths)) {
+      if (!is.na(widths[i])) k <- column_spec(k, i, width = widths[i])
+    }
+  }
+  k
+}
+
+placeholder_plot <- function(msg) {
+  ggplot() +
+    annotate("text", x = 0, y = 0, size = 4,
+             label = paste(strwrap(msg, 55), collapse = "\n")) +
+    theme_void() +
+    theme(plot.background = element_rect(colour = "grey70", fill = NA))
+}
+
+# ---- Lectura de soluciones RTKLIB (.pos) ----------------------------------
+# Supone salida LLH en grados, hora en hms y GPST (ver ppk.conf del Anexo A):
+# fecha hora lat lon h Q ns sdn sde sdu sdne sdeu sdun edad ratio
+leer_pos <- function(f) {
+  l <- readLines(f, warn = FALSE)
+  l <- l[!grepl("^%", l) & nzchar(trimws(l))]
+  if (!length(l)) return(NULL)
+  d <- utils::read.table(text = l, header = FALSE, stringsAsFactors = FALSE, fill = TRUE)
+  nm <- c("fecha", "hora", "lat", "lon", "h", "Q", "ns",
+          "sdn", "sde", "sdu", "sdne", "sdeu", "sdun", "edad", "ratio")
+  k <- seq_len(min(ncol(d), length(nm)))
+  names(d)[k] <- nm[k]
+  d
+}
+
+# Desplazamientos locales E/N/U (m) respecto de un origen (aprox. elipsoidal, válido a escala de metros)
+enu_local <- function(lat, lon, h, lat0, lon0, h0) {
+  a <- 6378137; e2 <- 0.00669437999014
+  phi <- lat0 * pi / 180
+  W <- sqrt(1 - e2 * sin(phi)^2)
+  N <- a / W
+  M <- a * (1 - e2) / W^3
+  data.frame(E = (lon - lon0) * pi / 180 * (N + h0) * cos(phi),
+             N = (lat - lat0) * pi / 180 * (M + h0),
+             U = h - h0)
+}
+```
+
+```{r datos-campana, include=FALSE}
+dir_ppk <- "gnss/ppk"
+archivos_epocas <- c("u-blox"  = file.path(dir_ppk, "rover_ublox_epocas.pos"),
+                     "Unicore" = file.path(dir_ppk, "rover_unicore_epocas.pos"))
+archivos_fijo   <- c("u-blox"  = file.path(dir_ppk, "rover_ublox_fijo.pos"),
+                     "Unicore" = file.path(dir_ppk, "rover_unicore_fijo.pos"))
+
+hay_pos <- all(file.exists(archivos_epocas))
+epocas <- NULL
+if (hay_pos) {
+  epocas <- tryCatch({
+    lst <- lapply(names(archivos_epocas), function(k) {
+      d <- leer_pos(archivos_epocas[[k]])
+      if (is.null(d)) return(NULL)
+      d$rover <- k
+      d
+    })
+    e <- do.call(rbind, lst)
+    fx <- e[e$Q == 1, ]; if (nrow(fx) == 0) fx <- e[e$Q == 2, ]
+    o <- c(lat = mean(fx$lat), lon = mean(fx$lon), h = mean(fx$h))
+    cbind(e, enu_local(e$lat, e$lon, e$h, o[["lat"]], o[["lon"]], o[["h"]]))
+  }, error = function(e) NULL)
+}
+hay_datos <- !is.null(epocas) && any(epocas$Q %in% c(1, 2))
+```
+
+\newpage
+
+# Resumen {-}
+
+Este informe documenta de forma reproducible el flujo completo de la práctica PA03: la conversión de observaciones crudas a RINEX 3.04, el control de calidad, la unión y el remuestreo de la base, la obtención independiente de su coordenada mediante CSRS-PPP y la generación de soluciones PPK con dos rovers, un Unicore UM980 de triple frecuencia y un u-blox ZED-F9P de doble frecuencia, que ocuparon el mismo punto del campus de la UASD el 2026-08-30. La base, registrada en 23 archivos horarios, se procesó en modo estático y entregó una coordenada en ITRF2020/IGc20, época 2026.7, con incertidumbres de ±0.002 m, ±0.003 m y ±0.010 m (95 %) en latitud, longitud y altura. Las soluciones PPK de ambos rovers quedaron en estado FLOAT en el 100 % de las épocas (razón de ajuste menor que 3), por lo que no se obtuvo ninguna solución fija, y las medias de los dos rovers difirieron en aproximadamente 0.19 m en latitud, 1.64 m en longitud y 1.03 m en altura. La incompatibilidad de las señales L2 entre la base y el rover u-blox, que limitó la doble diferencia a L1 de GPS y GLONASS, y la ausencia de correcciones de centro de fase son las principales limitaciones documentadas.
+
+```{r ficha}
+ficha <- data.frame(
+  Campo = c("Asignatura", "Universidad", "Práctica", "Estudiante", "Matrícula",
+            "Profesor", "Fecha de entrega", "Fecha de la campaña"),
+  Valor = c("Geomorfología (GEO-114)", "Universidad Autónoma de Santo Domingo (UASD)",
+            "Práctica de aula 3 (PA03)", "Yeral Feramir Santos Fabian", "100758838",
+            "Prof. José Ramón (Talibán)", "2026-10-05", "2026-08-30"),
+  stringsAsFactors = FALSE
+)
+kbl_pa(ficha, "Ficha de la práctica.", widths = c("4cm", "9cm"))
+```
+
+# Introducción {#sec:intro}
+
+El posicionamiento mediante sistemas globales de navegación por satélite (GNSS) es una herramienta básica de la geomorfología cuantitativa: permite georreferenciar puntos de control, perfiles y levantamientos de detalle con precisiones centimétricas cuando se explotan las observaciones de fase portadora [@hofmann2008; @teunissen2017]. Levantamientos GPS de alta resolución han servido, por ejemplo, para monitorear y modelar el cambio morfológico en cauces fluviales [@brasington2000], lo que hace relevante conocer con rigor la calidad de cada técnica de posicionamiento.
+
+Existen dos grandes enfoques. En el posicionamiento puntual preciso (PPP), un solo receptor estima su posición con órbitas y relojes precisos, y las coordenadas quedan en el marco de dichos productos [@zumberge1997; @kouba2001]; servicios como CSRS-PPP lo ofrecen en línea, con resolución de ambigüedades en versiones recientes [@tetreault2005; @banville2021]. En el posicionamiento relativo (RTK/PPK) se forman dobles diferencias entre base y rover (Ecuación \@ref(eq:ddfase)), y las ambigüedades enteras se resuelven con métodos como LAMBDA [@teunissen1995]; RTKLIB implementa este esquema [@takasu2009; @takasu2013]. Ambos dependen de un intercambio de datos normalizado [@igs2018rinex304] y de un marco de referencia con su época [@altamimi2016; @altamimi2023; @rebischung2016].
+
+Este informe compara las soluciones PPK obtenidas con un rover u-blox de doble frecuencia y otro Unicore de triple frecuencia sobre el mismo punto del campus de la UASD, procesadas contra una misma base cuya coordenada se determinó de forma independiente mediante un servicio en línea. La pregunta orientadora es si difieren la dispersión y el porcentaje de épocas FIX entre un receptor de doble y uno de triple frecuencia al ocupar el mismo punto. Como hipótesis de trabajo, cabe esperar que el receptor de triple frecuencia muestre igual o mayor porcentaje FIX y menor dispersión, porque dispone de más señales para resolver ambigüedades y mitigar errores; sin embargo, con ocupaciones de unos dos minutos, multipath en el campus y una base que puede no observar las mismas señales que los rovers, esta ventaja podría no manifestarse.
+
+El documento sigue una estructura IMRaD abreviada. Tras los objetivos (Sección \@ref(sec:objetivos)), la Sección \@ref(sec:metodos) describe los datos, la preparación de la base, la solución PPP y la configuración del PPK; la Sección \@ref(sec:resultados) presenta los resultados; la Sección \@ref(sec:discusion) los interpreta y sus limitaciones; y la Sección \@ref(sec:conclusiones) resume las conclusiones. Los comandos y scripts empleados se reúnen en el Anexo A.
+
+# Objetivos {#sec:objetivos}
+
+La práctica persigue seis objetivos, que estructuran el resto del documento:
+
+1. **Familiarizarse con un flujo reproducible de procesamiento GNSS**: convertir observaciones crudas a RINEX, preparar las observaciones estáticas de una base, obtener de forma independiente una coordenada precisa mediante un servicio de posprocesamiento y utilizarla después en un PPK (Secciones \@ref(sec:metodos) y \@ref(sec:resultados)).
+2. **Evaluar la calidad de los datos GNSS crudos**, mediante la inspección de los RINEX, para identificar interrupciones, saltos de ciclo (*cycle slips*), geometría desfavorable o pérdida de observaciones (Sección \@ref(sec:calidad)).
+3. **Comprender el papel del marco de referencia y de la época de las coordenadas**: interpretar una solución expresada en ITRF/IGS con su época y entender por qué no es necesario transformarla al WGS84 original (Transit) para realizar el PPK con RTKLIB-EX (Sección \@ref(sec:marco)).
+4. **Obtener de manera independiente la coordenada precisa de la base**, enviando personalmente el RINEX resultante a un servicio en línea; en este informe, CSRS-PPP de NRCan (Sección \@ref(sec:ppp)).
+5. **Generar soluciones PPK** con las observaciones tomadas en un mismo punto con dos rovers, Unicore (triple frecuencia) y u-blox (doble frecuencia), y comparar los resultados (Sección \@ref(sec:ppk)).
+6. **Documentar el flujo mediante código reproducible**, con `convbin` y `rnx2rtkp` ejecutados desde scripts, reunidos en el Anexo A.
+
+# Métodos {#sec:metodos}
+
+El flujo de trabajo va de los datos crudos a las tablas y figuras del informe (Figura \@ref(fig:flujo)). Las secciones siguientes describen cada etapa.
+
+```{r flujo, fig.cap="Flujo de trabajo reproducible de la PA03, desde los datos crudos hasta las tablas y figuras del informe.", fig.height=3.4}
+nodos <- data.frame(
+  x = c(1, 2, 3, 4, 4, 3, 2),
+  y = c(2, 2, 2, 2, 1, 1, 1),
+  etq = c("Datos crudos\n(.log, .ubx,\nbase horaria)",
+          "Conversión\nRINEX 3.04",
+          "Control de\ncalidad\n(encabezados)",
+          "cat + convbin\nunión + 30 s",
+          "Servicio en línea\n(CSRS-PPP)",
+          "rnx2rtkp\nPPK (Q = 1 o 2)",
+          "R: tablas,\nestadística\ny mapas"))
+seg <- data.frame(
+  x    = nodos$x[-7] + sign(diff(nodos$x)) * 0.4,
+  y    = nodos$y[-7] + sign(diff(nodos$y)) * 0.3,
+  xend = nodos$x[-1] - sign(diff(nodos$x)) * 0.4,
+  yend = nodos$y[-1] - sign(diff(nodos$y)) * 0.3
+)
+ggplot() +
+  geom_rect(data = nodos, aes(xmin = x - 0.4, xmax = x + 0.4, ymin = y - 0.3, ymax = y + 0.3),
+            fill = "#e8f0fa", colour = "#2166ac") +
+  geom_text(data = nodos, aes(x = x, y = y, label = etq), size = 2.6, lineheight = 0.9) +
+  geom_segment(data = seg, aes(x = x, y = y, xend = xend, yend = yend),
+               arrow = arrow(length = unit(2.5, "mm"), type = "closed")) +
+  xlim(0.5, 4.5) + ylim(0.6, 2.4) +
+  theme_void()
+```
+
+## Recursos y software {#sec:recursos}
+
+Los archivos fuente, la base horaria y las colectas de los rovers, se obtuvieron de la [carpeta de Drive de la práctica](https://drive.google.com/drive/folders/1QwhfmtxwDR04yZ38Cwc9Fkcq6g_mmFg0?usp=drive_link) y se organizaron en un proyecto con las carpetas `gnss/raw`, `gnss/rinex`, `gnss/ppp`, `gnss/ppk` y `gnss/scripts`. El procesamiento se apoya en RTKLIB-EX (antes "demo5"), derivado del paquete RTKLIB [@everett_rtklibex; @takasu2009; @takasu2013], que ofrece aplicaciones gráficas (RTKCONV, RTKPOST, RTKPLOT) y sus equivalentes de terminal (`convbin`, `rnx2rtkp`). Se previó el uso de GFZRNX [@nischan2016] para unir y remuestrear los RINEX, pero el servidor de GFZ-Potsdam no fue accesible desde la red universitaria (Sección \@ref(sec:base)). La conversión y los intercambios se rigen por la especificación RINEX 3.04 [@igs2018rinex304]. Las tablas, la estadística y los gráficos se generan en R con `bookdown` y `kableExtra`. RTKCONV y RTKPOST pueden usarse para explorar opciones, pero el procesamiento reportado se ejecutó con `convbin` y `rnx2rtkp` desde scripts, de modo que sea reproducible. Las herramientas y sus versiones se resumen en la Tabla \@ref(tab:software).
+
+```{r software}
+soft <- data.frame(
+  Herramienta = c("RTKLIB-EX (demo5)", "GFZRNX", "Servicio en línea", "R, bookdown, kableExtra"),
+  Función = c("Conversión (convbin), posproceso relativo (rnx2rtkp) e inspección (RTKPLOT)",
+              "Unión, remuestreo y verificación de archivos RINEX",
+              "Coordenada de la base: CSRS-PPP",
+              "Tablas, estadística, figuras y redacción reproducible"),
+  `Versión utilizada` = c("convbin v2.4.3 b34 y rnx2rtkp v2.4.3 b34",
+                          "No disponible (servidor GFZ bloqueado; se usó cat + convbin -ti 30)",
+                          "CSRS-PPP v5.15.5 (NRCan, procesamiento 2026-09-30)",
+                          "R 4.4.0, bookdown, kableExtra, ggplot2"),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+kbl_pa(soft, "Herramientas empleadas en la práctica.", widths = c("3.5cm", "7cm", "3.5cm"))
+```
+
+## Datos y colectas {#sec:datos}
+
+La campaña se realizó el 2026-08-30 en un mismo punto del campus de la UASD. Se dispuso de dos colectas cortas, una con un receptor Unicore UM980 (triple frecuencia, archivos `.log`) y otra con un u-blox ZED-F9P (doble frecuencia, archivos `.ubx`), ambas con la antena montada sobre un jalón de aluminio. La colecta del Unicore abarcó desde las 16:19:28.6 hasta las 16:21:35.4 GPST y contiene 635 épocas; la del u-blox, desde las 16:27:58 hasta las 16:30:04 GPST, con 632 épocas (Tabla \@ref(tab:colectas)). Las dos colectas no fueron, por tanto, simultáneas. La base se registró en 23 archivos horarios Unicore y sirvió de referencia común a ambos rovers.
+
+```{r colectas}
+col <- data.frame(
+  Rover = c("Unicore", "u-blox"),
+  Receptor = c("UM980", "ZED-F9P"),
+  Frecuencias = c("Triple", "Doble"),
+  `Inicio (hora GPS)` = c("16:19:28.6", "16:27:58"),
+  `Fin (hora GPS)` = c("16:21:35.4", "16:30:04"),
+  `Épocas` = c("635", "632"),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+kbl_pa(col, "Colectas de los rovers de este informe.", wide = TRUE)
+```
+
+## Antena, ARP, PCO, APC y jalón {#sec:antena}
+
+Para interpretar la posición obtenida conviene distinguir tres conceptos de antena. El punto de referencia de la antena (ARP, *Antenna Reference Point*) es el punto físico respecto del cual se mide la altura instrumental o del jalón; el desplazamiento del centro de fase (PCO, *Phase Center Offset*) es el vector que relaciona el ARP con el centro de fase medio de una señal o frecuencia; y el centro de fase de la antena (APC, *Antenna Phase Center*) es el centro de fase efectivo, que depende de la señal y de la dirección de llegada, variaciones que describe el PCV. Bajo el supuesto de un jalón vertical y nivelado, la relación entre estos puntos se expresa en la Ecuación \@ref(eq:apc), donde $\hat{\mathbf{u}}$ es el vector unitario vertical local y $h_{\mathrm{ARP\text{-}marca}}$ es la altura ARP--marca.
+
+\begin{equation}
+\mathbf{r}_{\mathrm{APC}} = \mathbf{r}_{\mathrm{ARP}} + \mathrm{PCO}, \qquad
+\mathbf{r}_{\mathrm{marca}} = \mathbf{r}_{\mathrm{ARP}} - h_{\mathrm{ARP\text{-}marca}}\,\hat{\mathbf{u}}
+(\#eq:apc)
+\end{equation}
+
+La altura del jalón no se trata como una corrección genérica de 2 m ni se inventa ninguna corrección APC: solo corresponde emplear la altura ARP--marca y los parámetros PCO/PCV suministrados. En esta campaña el docente no suministró el modelo de antena (ANTEX), la altura ARP--marca ni el PCO/PCV (Tabla \@ref(tab:antena)), de modo que la coordenada final de cada rover es relativa al centro de fase y no a la marca del terreno. La Figura \@ref(fig:geometria) es un esquema conceptual, no a escala.
+
+```{r geometria, fig.cap="Esquema conceptual (no a escala) de la marca del terreno, el ARP y el APC sobre el jalón.", fig.height=3.6}
+pts <- data.frame(
+  y = c(0, 1.20, 1.32),
+  etq = c("Marca / punto del terreno", "ARP (Antenna Reference Point)",
+          "APC (centro de fase = ARP + PCO)"))
+ggplot() +
+  geom_segment(aes(x = 0, xend = 0, y = 0, yend = 1.6), linewidth = 2, colour = "grey60") +
+  geom_point(data = pts, aes(x = 0, y = y), size = 4, colour = c("#1b7837", "#2166ac", "#b2182b")) +
+  geom_text(data = pts, aes(x = 0.06, y = y, label = etq), hjust = 0, size = 3.4) +
+  annotate("segment", x = -0.12, xend = -0.12, y = 0, yend = 1.2,
+           arrow = arrow(ends = "both", length = unit(2, "mm"))) +
+  annotate("text", x = -0.16, y = 0.6, label = "h ARP-marca", hjust = 1, size = 3.4) +
+  xlim(-1.3, 1.6) + ylim(-0.1, 1.7) +
+  theme_void()
+```
+
+```{r antena}
+ant <- data.frame(
+  `Parámetro` = c("Modelo de antena (ANTEX)", "Altura ARP--marca (m)", "PCO (n, e, u)",
+                  "PCV / archivo de calibración", "Punto al que corresponde la coordenada final"),
+  `Rover u-blox` = c("No suministrado por el docente", "No suministrado por el docente",
+                     "No suministrado por el docente", "No suministrado por el docente",
+                     "Coordenada relativa al APC"),
+  `Rover Unicore` = c("No suministrado por el docente", "No suministrado por el docente",
+                      "No suministrado por el docente", "No suministrado por el docente",
+                      "Coordenada relativa al APC"),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+kbl_pa(ant, "Información de antena y de altura del jalón.",
+       widths = c("5cm", "4.5cm", "4.5cm"))
+```
+
+## Conversión a RINEX 3.04 {#sec:conversion}
+
+Las observaciones crudas contienen pseudorango, fase portadora, Doppler, relación señal/ruido y mensajes de navegación. Las del u-blox se convirtieron a RINEX 3.04 con `convbin` [@takasu2013; @igs2018rinex304]. El `.log` del rover Unicore no pudo convertirse con RTKLIB-EX, por lo que se utilizó UPrecise/UnicoreConverter (Tabla \@ref(tab:anomalias)). La conversión no se dio por correcta solo porque el programa produjera un archivo: se revisaron el encabezado y las primeras épocas de cada RINEX resultante. Los comandos figuran en el Anexo A.
+
+## Evaluación de la calidad de los datos {#sec:calidad}
+
+Se inspeccionaron las fechas y horas, el intervalo, las constelaciones, los tipos de observación y la continuidad de los RINEX de la base y de ambos rovers. En los RINEX Unicore se prestó atención a `SYS / # / OBS TYPES` y `SYS / PHASE SHIFT`: si un servicio PPP emite advertencias de *phase alignment*, no se supone que baste con escribir ceros en `SYS / PHASE SHIFT`; la advertencia se documenta y se comprueban los observables realmente presentes. RTKPLOT permite examinar la disponibilidad de satélites, el DOP, las interrupciones y los posibles *cycle slips*, pero esa inspección no se realizó en esta entrega. Los resultados se consignan en la Tabla \@ref(tab:calidad) y las incidencias en la Tabla \@ref(tab:anomalias).
+
+## Preparación de la base {#sec:base}
+
+La base se registró en archivos horarios. Se intentó la unión con `gfzrnx` [@nischan2016], pero el servidor de GFZ-Potsdam rechazó la conexión desde la red universitaria. Se optó entonces por la alternativa prevista en el enunciado: unir los archivos binarios con `cat` y convertir el flujo continuo con `convbin`. Para el envío al servicio no se necesita una observación por segundo, por lo que se generó una copia a 30 s con la opción `-ti 30` de `convbin`. El enunciado menciona tanto 30 s como 15 s para la cadencia; este informe usa 30 s de forma consistente. Que el archivo enviado tiene esa cadencia se demuestra con las comprobaciones de la Tabla \@ref(tab:checks), cuyos comandos se incluyen en el Anexo A.
+
+## Solución PPP independiente de la base {#sec:ppp}
+
+El RINEX de 30 s se envió personalmente a CSRS-PPP de NRCan [@tetreault2005; @banville2021; @nrcan_csrsppp] y se conservó el informe de salida; no se utilizó una coordenada PPP facilitada por otra persona. Entre las opciones disponibles figuran también OPUS del NGS/NOAA [@soler2006; @ngs_opus] y AUSPOS de Geoscience Australia [@ga_auspos]; CSRS-PPP requiere registro, mientras que AUSPOS calcula una solución de red por dobles diferencias (no PPP) con datos GPS de doble frecuencia. En el PPP, la combinación libre de ionosfera de la Ecuación \@ref(eq:ifppp) elimina el efecto de primer orden de la ionosfera [@zumberge1997; @kouba2001].
+
+\begin{equation}
+L_{IF} = \frac{f_1^{2}\,L_1 - f_2^{2}\,L_2}{f_1^{2} - f_2^{2}}
+(\#eq:ifppp)
+\end{equation}
+
+## Marco de referencia y época {#sec:marco}
+
+En versiones anteriores de la práctica se transformaba la coordenada ITRF a WGS84 original (Transit) con HTDP. En este informe no se realiza esa transformación. Una solución moderna puede estar expresada, por ejemplo, en ITRF2020/IGS20 a la época de las observaciones. ITRF es un marco dinámico: además del nombre del marco importa la época, porque las coordenadas evolucionan según la Ecuación \@ref(eq:itrf) [@altamimi2016; @altamimi2023; @rebischung2016].
+
+\begin{equation}
+\mathbf{X}(t) = \mathbf{X}(t_0) + \dot{\mathbf{X}}\,(t - t_0)
+(\#eq:itrf)
+\end{equation}
+
+RTKLIB-EX opera con coordenadas cartesianas o geodésicas y con los marcos implícitos en las órbitas empleadas; no exige que una coordenada PPP moderna, coherente con la época de observación, sea transformada artificialmente. Base y rovers se observaron en la misma campaña y, para el PPK con efemérides difundidas, se usa directamente la coordenada PPP de la base. Si en el futuro se emplean productos precisos SP3/CLK, estos se alinean con realizaciones IGS/ITRF modernas, lo que refuerza la necesidad de conservar y documentar el marco y la época. Por ello, la coordenada de la base se obtuvo mediante PPP en ITRF2020/IGc20 a la época 2026.7 y se utilizó directamente como coordenada fija de la base en el PPK, sin transformación a WGS84 (Transit).
+
+## Configuración del PPK con RTKLIB-EX {#sec:ppk}
+
+El PPK se exploró en RTKPOST, pero el procesamiento final se ejecutó con `rnx2rtkp` [@everett_rtklibex; @takasu2013] a partir de un archivo de configuración conservado en el repositorio (`gnss/scripts/ppk.conf`, reproducido en el Anexo A). La Tabla \@ref(tab:conf) resume los parámetros esenciales y su justificación. El criterio de aceptación de una solución fija se basa en el estado de calidad Q = 1 (FIX) de RTKLIB. La resolución entera se apoya en las dobles diferencias de fase (Ecuación \@ref(eq:ddfase)) y en un contraste de razón (*ratio test*) entre el mejor y el segundo mejor candidato entero (Ecuación \@ref(eq:ratio)), con las ambigüedades estimadas mediante métodos de tipo LAMBDA [@teunissen1995; @takasu2013].
+
+\begin{equation}
+\nabla\Delta\Phi_{rb}^{ij} = \nabla\Delta\rho_{rb}^{ij} + \lambda\,\nabla\Delta N_{rb}^{ij} - \nabla\Delta I_{rb}^{ij} + \nabla\Delta T_{rb}^{ij} + \varepsilon
+(\#eq:ddfase)
+\end{equation}
+
+\begin{equation}
+R = \frac{Q_2}{Q_1} \geq R_{\min}
+(\#eq:ratio)
+\end{equation}
+
+En la Ecuación \@ref(eq:ddfase), $r$ y $b$ son rover y base, $i$ y $j$ los satélites, $\rho$ el rango geométrico, $\lambda$ la longitud de onda, $N$ la ambigüedad entera, $I$ y $T$ los retardos ionosférico y troposférico y $\varepsilon$ el ruido y el multipath. En la Ecuación \@ref(eq:ratio), $Q_1$ y $Q_2$ son las sumas de residuos cuadráticos del mejor y del segundo mejor candidato.
+
+```{r conf}
+conf <- data.frame(
+  `Parámetro` = c("Modo de posicionamiento", "Frecuencias", "Constelaciones", "Máscara de elevación",
+                  "Resolución de ambigüedades", "Ionosfera", "Troposfera", "Efemérides",
+                  "Coordenada fija de la base", "Antena", "Altura ARP--marca", "Formato de salida"),
+  `Valor adoptado` = c(
+    "Cinemático (-p 2) para época por época; estático (-p 3) para la solución resumen",
+    "u-blox: L1+L2 (-f 2). Unicore: L1+L2+L5 (-f 3), limitado a lo que también observe la base",
+    "GPS+GLONASS+Galileo+BeiDou (pos1-navsys = 45), según disponibilidad",
+    "15 grados",
+    "Fix-and-hold; umbral de ratio = 3",
+    "Difundida (broadcast)", "Saastamoinen", "Difundidas (broadcast)",
+    "XYZ del PPP propio, con marco y época documentados",
+    "Sin ANTEX (no suministrado)",
+    "No suministrada (0.0 m)",
+    "LLH en grados, hora GPST en hms"),
+  Justificación = c(
+    "Cinemático para observar la dispersión época por época; estático para resumen puntual",
+    "u-blox limitado a L1+L2 por hardware; Unicore probado con L1+L2",
+    "Solo GPS+GLONASS dieron doble diferencia viable; GAL/BDS no compatibles en L2",
+    "15 grados estándar para descartar satélites bajos con multipath",
+    "FLOAT forzado por incompatibilidad de señales L2; se documenta como limitación",
+    "Difundida (broadcast) disponible; no se usaron SP3/CLK",
+    "Saastamoinen modelo estándar para tropósfera",
+    "Efemérides difundidas en el .nav generado por convbin",
+    "XYZ ECEF del PPP CSRS-PPP (ITRF2020 / IGc20, 2026.7)",
+    "Sin ANTEX; se declara limitación",
+    "Altura ARP-marca no suministrada por el docente; se deja en 0.0",
+    "LLH en grados para facilitar comparación geográfica"),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+kbl_pa(conf, "Parámetros esenciales del PPK con RTKLIB-EX.",
+       widths = c("3.5cm", "6cm", "4cm"))
+```
+
+## Generación de las soluciones y comparación {#sec:comparacion}
+
+Ambos rovers se procesaron respecto de la misma base, cuya coordenada se obtuvo personalmente por PPP. Por cada rover se generaron dos salidas: una solución estática que resume la posición y una salida época por época para estudiar la dispersión, el estado FIX/FLOAT y la estabilidad, de modo que resultan cuatro productos de solución. No basta con presentar archivos `.pos`: el script y el archivo de configuración del Anexo A permiten regenerarlos a partir de los RINEX.
+
+Las soluciones se comparan época por época: diferencia entre coordenadas promediadas, dispersión, porcentaje de épocas FIX, presencia de FLOAT, SINGLE, atípicos e interrupciones, diferencias horizontales y verticales, y posible efecto de la doble frente a la triple frecuencia. La dispersión horizontal se resume con la Ecuación \@ref(eq:sh), donde $s_E$ y $s_N$ son las desviaciones estándar de las componentes este y norte.
+
+\begin{equation}
+s_H = \sqrt{s_E^{2} + s_N^{2}}
+(\#eq:sh)
+\end{equation}
+
+Como las colectas no son temporalmente coincidentes, no se tratan como muestras emparejadas. La prueba t de Student no emparejada (Tabla \@ref(tab:comp)) debe leerse junto con sus supuestos y limitaciones: las épocas consecutivas, registradas a una cadencia de unos 5 Hz, están autocorrelacionadas, lo que infla la significancia aparente, y con ocupaciones de dos minutos la muestra efectiva es pequeña. Por ello se acompaña de medidas descriptivas de dispersión y de diferencias en metros (Tabla \@ref(tab:disp)).
+
+# Resultados {#sec:resultados}
+
+## Datos de entrada, calidad y anomalías {#sec:res-calidad}
+
+La Tabla \@ref(tab:calidad) resume los controles de calidad de los RINEX. La base cubre desde el 2026-08-30 13:07:56 hasta el 2026-08-31 11:05:30 GPST, con 79055 épocas a 1 s; el rover u-blox contiene 632 épocas y el Unicore 635, sin interrupciones en ninguno de los tres archivos. La copia de la base enviada al servicio, `base_unida_30s.obs`, pesa 12 MB y contiene 2635 intervalos idénticos de 30 s (Tabla \@ref(tab:checks)).
+
+```{r calidad}
+cal <- data.frame(
+  `Verificación` = c("Versión RINEX", "Primera observación (GPST)", "Última observación (GPST)",
+                     "Intervalo (s)", "Constelaciones", "Tipos de observación",
+                     "SYS / PHASE SHIFT", "Épocas totales", "Interrupciones",
+                     "Cycle slips (RTKPLOT)", "Satélites mínimos / DOP máximo"),
+  Base = c("3.04", "2026-08-30 13:07:56", "2026-08-31 11:05:30", "1",
+           "G+R+E+C", "GPS:20, GLO:12, GAL:12, BDS:12",
+           "Incompleto (con advertencias CSRS)", "79055", "0",
+           "No inspeccionado con RTKPLOT", "~22 / ~1.5"),
+  `Rover u-blox` = c("3.04", "2026-08-30 16:27:58", "2026-08-30 16:30:04", "0.205",
+                     "G+R+E+C+S", "GPS:4, GLO:4, GAL:4, BDS:2, SBS:2",
+                     "Completo", "632", "0", "No inspeccionado", "~25 / ~2"),
+  `Rover Unicore` = c("3.04", "2026-08-30 16:19:28.6", "2026-08-30 16:21:35.4", "0.2",
+                      "G+R+E+C", "GPS:16, GLO:12, GAL:16, BDS:16",
+                      "Completo", "635", "0", "No inspeccionado", "~30 / ~1.5"),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+kbl_pa(cal, "Control de calidad de los RINEX de la base y de los rovers.",
+       widths = c("4.5cm", "3cm", "3cm", "3cm"))
+```
+
+```{r checks}
+chk <- data.frame(
+  `Comprobación` = c("Archivos horarios recibidos", "Archivos unidos", "Primera observación",
+                     "Última observación", "Intervalo (s)", "Nombre y tamaño del archivo enviado"),
+  Resultado = c("23 archivos .bin",
+                "1 (base_completa.obs, 667 MB)",
+                "2026-08-30 13:07:56 GPST",
+                "2026-08-31 11:05:30 GPST",
+                "30 (2635 intervalos idénticos de 30 s)",
+                "base_unida_30s.obs, 12 MB, sha256: 993c48d9..."),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+kbl_pa(chk, "Evidencias reproducibles sobre el RINEX de la base enviado al servicio.",
+       widths = c("6cm", "8cm"))
+```
+
+Se documentaron cuatro incidencias (Tabla \@ref(tab:anomalias)). El `.log` del rover Unicore no pudo convertirse con RTKLIB-EX y se convirtió con UPrecise/UnicoreConverter. Hubo incompatibilidad de señales L2 entre la base (L2W) y el rover u-blox (L2X), de modo que solo L1 de GPS y GLONASS permitió formar dobles diferencias. CSRS-PPP emitió tres advertencias: ausencia de APC-ARP y de PCO para Galileo y para GLONASS, que se documentan como limitación. Por último, el 100 % de las épocas de ambos rovers quedó en estado FLOAT, resultado que se acepta como válido y documentado.
+
+```{r anomalias}
+ano <- data.frame(
+  Incidencia = c("Advertencia de conversión", "Incompatibilidad de señales",
+                 "Advertencia del servicio PPP", "Estado de solución PPK"),
+  Archivo = c("Rover Unicore (.log)", "—", "—", "—"),
+  `Época o señal` = c("No convertible con RTKLIB-EX", "L2", "Sin APC-ARP ni PCO", "100 % épocas FLOAT"),
+  Tratamiento = c("Convertido con UPrecise/UnicoreConverter",
+                  "Doble diferencia solo en L1 GPS/GLO",
+                  "Documentado como limitación",
+                  "Aceptado como resultado válido documentado"),
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+kbl_pa(ano, "Registro de incidencias detectadas durante la conversión, el control de calidad y el envío al servicio PPP.",
+       widths = c("4cm", "3cm", "3.5cm", "4cm"))
+```
+
+## Coordenada PPP de la base {#sec:res-ppp}
+
+El servicio CSRS-PPP de NRCan (v5.15.5) procesó el archivo `base_unida_30s.obs` (12 MB, 2636 épocas a 30 s, 21 h 57 min 30 s) en modo Static/Final y entregó la coordenada de la base en ITRF2020/IGc20, época 2026.7 (Tabla \@ref(tab:ppp)). Sus componentes geodésicas son latitud $18^{\circ}\,27'\,34.73790''$ N, longitud $-69^{\circ}\,55'\,0.07400''$ W y altura elipsoidal de -11.584 m, con incertidumbres (95 %) de ±0.002 m, ±0.003 m y ±0.010 m, respectivamente; las coordenadas cartesianas figuran en la Tabla \@ref(tab:base-ppp). El servicio emitió tres advertencias: sin APC-ARP, sin PCO de Galileo y sin PCO de GLONASS.
+
+```{r ppp}
+ppp <- data.frame(
+  Campo = c("Servicio utilizado", "Archivo RINEX enviado", "Intervalo de observación",
+            "Duración total", "Modo de procesamiento", "Marco de referencia de la solución",
+            "Época de la coordenada", "Coordenadas (LLH y/o XYZ)", "Incertidumbres reportadas",
+            "Tratamiento de antena y altura instrumental", "Advertencias emitidas por el servicio"),
+  Valor = c("CSRS-PPP de NRCan (v5.15.5)",
+            "base_unida_30s.obs (12 MB, 2636 épocas)",
+            "30 s",
+            "21 h 57 min 30 s",
+            "Static / Final",
+            "ITRF2020 / IGc20",
+            "2026.7",
+            paste0("LLH: Lat 18 27 34.73790 N; Lon -69 55 0.07400 W; h = -11.584 m. ",
+                   "ECEF: X = 2078167.0251 m; Y = -5683987.2712 m; Z = 2006702.5967 m"),
+            "Lat ±0.002 m; Lon ±0.003 m; h ±0.010 m (95 %)",
+            "Sin APC-ARP ni PCO Galileo/GLONASS; documentado como limitación",
+            "Sin APC-ARP; sin PCO Galileo/GLONASS; 3 advertencias"),
+  stringsAsFactors = FALSE
+)
+kbl_pa(ppp, "Registro de la solución de la base obtenida con el servicio en línea.",
+       widths = c("6cm", "8cm"))
+```
+
+```{r base-ppp}
+bppp <- data.frame(
+  Magnitud = c("Marco de referencia", "Época", "X (m)", "Y (m)", "Z (m)",
+               "Latitud", "Longitud", "Altura elipsoidal (m)"),
+  Valor = c("ITRF2020 / IGc20", "2026.7", "2078167.0251", "-5683987.2712", "2006702.5967",
+            "18 27 34.73790 N", "-69 55 0.07400 W", "-11.584"),
+  Incertidumbre = c("—", "—", "—", "—", "—", "±0.002 m", "±0.003 m", "±0.010 m"),
+  stringsAsFactors = FALSE
+)
+kbl_pa(bppp, "Coordenada PPP de la base (no equiparable a las observaciones de los rovers).",
+       widths = c("5cm", "5cm", "4cm"))
+```
+
+## Soluciones PPK de los rovers {#sec:res-ppk}
+
+Ninguno de los dos rovers alcanzó una solución fija: el rover u-blox obtuvo 0 % de épocas FIX y el Unicore también 0 %, pues el 100 % de las épocas de ambos quedó en estado FLOAT, con razón de ajuste menor que 3 (Tablas \@ref(tab:rovers) y \@ref(tab:disp)). Por esa razón, las posiciones medias y la dispersión de la Tabla \@ref(tab:rovers) y de la Tabla \@ref(tab:disp) se calculan con las épocas FLOAT, y la solución estática se muestra en la Tabla \@ref(tab:fijo). La coordenada PPP de la base (Tabla \@ref(tab:base-ppp)) no se mezcla con las de los rovers, porque no son observaciones equivalentes. Cuando al compilar este documento no se dispone de los archivos `.pos` de `gnss/ppk`, las celdas que dependen de ellos se muestran con un guion y se conservan únicamente los valores suministrados del procesamiento.
+
+```{r tablas-resumen, include=FALSE}
+nd <- "—"
+rovers <- c("u-blox", "Unicore")
+n_ep <- c(632L, 635L)            # épocas de los RINEX de u-blox y Unicore
+
+tab_rovers <- data.frame(
+  Rover = rovers,
+  Receptor = c("Doble frecuencia", "Triple frecuencia"),
+  `Posición media (lat, lon, h)` = nd,
+  `% FIX` = sprintf("0.0 (0/%d)", n_ep),
+  Observaciones = "100 % de épocas FLOAT (razón < 3)",
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+tab_fijo <- data.frame(
+  Rover = rovers,
+  `Última época (GPST)` = nd, Q = nd,
+  `Lat, lon (grados), h (m)` = nd,
+  `DE n, e, u (m)` = nd,
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+tab_disp <- data.frame(
+  Rover = rovers,
+  `Épocas` = as.character(n_ep), `% FIX` = "0.0", `% FLOAT` = "100.0", `% otras` = "0.0",
+  `DE E (m)` = nd, `DE N (m)` = nd, `DE U (m)` = nd, `sH (m)` = nd,
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+tab_comp <- data.frame(
+  Componente = c("Lat (N)", "Lon (E)", "H (U)"),
+  `Media u-blox` = nd, `Media Unicore` = nd,
+  `Diferencia absoluta (m)` = c("aprox. 0.19", "aprox. 1.64", "aprox. 1.03"),
+  p = nd,
+  `Interpretación` = "Valor aproximado; sin prueba estadística",
+  check.names = FALSE, stringsAsFactors = FALSE
+)
+
+if (hay_datos) {
+  tryCatch({
+    for (i in 1:2) {
+      d <- epocas[epocas$rover == rovers[i], ]
+      if (nrow(d) == 0) next
+      f <- d[d$Q == 1, ]; if (nrow(f) == 0) f <- d[d$Q == 2, ]
+      tab_disp[i, 2] <- as.character(nrow(d))
+      tab_disp[i, 3] <- sprintf("%.1f", 100 * mean(d$Q == 1))
+      tab_disp[i, 4] <- sprintf("%.1f", 100 * mean(d$Q == 2))
+      tab_disp[i, 5] <- sprintf("%.1f", 100 * mean(!(d$Q %in% 1:2)))
+      tab_rovers[i, 4] <- sprintf("%.1f (%d/%d)", 100 * mean(d$Q == 1), sum(d$Q == 1), nrow(d))
+      if (nrow(f) > 1) {
+        tab_rovers[i, 3] <- sprintf("%.8f, %.8f, %.3f", mean(f$lat), mean(f$lon), mean(f$h))
+        de <- c(sd(f$E), sd(f$N), sd(f$U))
+        tab_disp[i, 6:8] <- sprintf("%.3f", de)
+        tab_disp[i, 9] <- sprintf("%.3f", sqrt(de[1]^2 + de[2]^2))
+        tab_rovers[i, 5] <- if (all(f$Q == 1)) "Media y DE con épocas Q = 1" else
+          "Sin épocas FIX: media y DE con épocas FLOAT (Q = 2)"
+      }
+    }
+  }, error = function(e) NULL)
+
+  tryCatch({
+    sel <- function(k) {
+      x <- epocas[epocas$rover == k & epocas$Q == 1, ]
+      if (nrow(x) == 0) x <- epocas[epocas$rover == k & epocas$Q == 2, ]
+      x
+    }
+    a <- sel("u-blox")
+    b <- sel("Unicore")
+    comp <- list(c("lat", "N"), c("lon", "E"), c("h", "U"))
+    for (i in 1:3) {
+      v <- comp[[i]]
+      tt <- t.test(b[[v[2]]], a[[v[2]]], var.equal = TRUE)     # Student no pareada
+      fmt <- if (i < 3) "%.8f" else "%.3f"
+      tab_comp[i, 2] <- sprintf(fmt, mean(a[[v[1]]]))
+      tab_comp[i, 3] <- sprintf(fmt, mean(b[[v[1]]]))
+      tab_comp[i, 4] <- sprintf("%.3f", abs(mean(b[[v[2]]]) - mean(a[[v[2]]])))
+      tab_comp[i, 5] <- format.pval(tt$p.value, digits = 3, eps = 1e-4)
+      tab_comp[i, 6] <- if (tt$p.value < 0.05)
+        "Diferencia estadísticamente significativa (0.05); valorar su magnitud en metros"
+      else "Sin evidencia de diferencia (0.05)"
+    }
+  }, error = function(e) NULL)
+}
+
+if (all(file.exists(archivos_fijo))) {
+  tryCatch({
+    for (i in 1:2) {
+      u <- leer_pos(archivos_fijo[[i]]); u <- u[nrow(u), ]
+      tab_fijo[i, 2] <- paste(u$fecha, u$hora)
+      tab_fijo[i, 3] <- as.character(u$Q)
+      tab_fijo[i, 4] <- sprintf("%.8f, %.8f, %.3f", u$lat, u$lon, u$h)
+      tab_fijo[i, 5] <- sprintf("%.3f, %.3f, %.3f", u$sdn, u$sde, u$sdu)
+    }
+  }, error = function(e) NULL)
+}
+```
+
+```{r rovers}
+kbl_pa(tab_rovers, "Resumen de las soluciones PPK promediadas por rover (épocas FIX o, en su defecto, FLOAT).",
+       widths = c("2cm", "2.6cm", "5cm", "2cm", "3.5cm"), wide = TRUE)
+```
+
+```{r fijo}
+kbl_pa(tab_fijo, "Solución estática (posición fija resumida) de cada rover.", wide = TRUE)
+```
+
+```{r disp}
+kbl_pa(tab_disp, "Estados de solución y dispersión (desviación estándar, DE) de las épocas FIX, o FLOAT si no hay FIX, por rover.", wide = TRUE)
+```
+
+La diferencia entre las medias de los dos rovers fue de aproximadamente 0.19 m en latitud, 1.64 m en longitud y 1.03 m en altura (Tabla \@ref(tab:comp)). La dispersión de las componentes este, norte y vertical se visualiza en la Figura \@ref(fig:dispersion) y la distribución espacial de las épocas en la Figura \@ref(fig:enu).
+
+```{r comp}
+kbl_pa(tab_comp, "Comparación por componente entre los rovers u-blox y Unicore (prueba t de Student no pareada cuando se dispone de los .pos).",
+       widths = c("2cm", "2.6cm", "2.6cm", "2.6cm", "1.2cm", "3.6cm"), wide = TRUE)
+```
+
+```{r dispersion, fig.cap="Dispersión de las componentes E, N y U (épocas FIX o FLOAT) respecto de la media conjunta, por rover.", fig.height=4}
+p <- if (hay_datos) {
+  d <- epocas[epocas$Q %in% c(1, 2), ]
+  long <- rbind(data.frame(rover = d$rover, comp = "E", val = d$E),
+                data.frame(rover = d$rover, comp = "N", val = d$N),
+                data.frame(rover = d$rover, comp = "U", val = d$U))
+  ggplot(long, aes(rover, val, fill = rover)) +
+    geom_violin(alpha = 0.5, colour = NA) +
+    geom_boxplot(width = 0.15, outlier.size = 0.8) +
+    facet_wrap(~comp, scales = "free_y") +
+    labs(x = NULL, y = "Desviación respecto de la media conjunta (m)") +
+    theme_minimal() + theme(legend.position = "none")
+} else {
+  placeholder_plot("Figura no disponible al compilar: requiere los archivos .pos de época por época en gnss/ppk.")
+}
+p
+```
+
+```{r enu, fig.cap="Posiciones época por época en coordenadas locales E/N respecto de la media conjunta de las épocas FIX o FLOAT.", fig.height=4.2}
+p <- if (hay_datos) {
+  ggplot(epocas, aes(E, N, colour = rover, shape = factor(Q))) +
+    geom_point(alpha = 0.7, size = 1.5) +
+    coord_equal() +
+    labs(x = "Este (m)", y = "Norte (m)", colour = "Rover", shape = "Q") +
+    theme_minimal()
+} else {
+  placeholder_plot("Gráfico no disponible al compilar: requiere los archivos .pos de época por época en gnss/ppk.")
+}
+p
+```
+
+Las soluciones también pueden representarse en RTKPLOT o QGIS, con una simbología que distinga los dos rovers. Como la separación entre ellas suele ser demasiado pequeña para apreciarse a escala cartográfica, el gráfico en coordenadas locales E/N de la Figura \@ref(fig:enu) complementa la captura del mapa de la Figura \@ref(fig:mapa).
+
+```{r mapa, fig.cap="Representación cartográfica de las soluciones de ambos rovers (QGIS o RTKPLOT)."}
+ruta_mapa <- "img/mapa_qgis.png"
+if (file.exists(ruta_mapa)) {
+  knitr::include_graphics(ruta_mapa)
+} else {
+  placeholder_plot("Captura cartográfica no incluida en esta entrega (img/mapa_qgis.png).")
+}
+```
+
+# Discusión {#sec:discusion}
+
+**Interpretación.** Ninguno de los dos rovers alcanzó una solución fija: el 100 % de las épocas quedó en estado FLOAT, de modo que el porcentaje de épocas FIX fue idéntico (0 %) y no permite distinguir entre el receptor de doble y el de triple frecuencia. La pregunta orientadora queda así respondida solo en parte: el porcentaje FIX no difiere, y la comparación de la dispersión debe leerse con cautela porque describe soluciones FLOAT y no fijas (Tabla \@ref(tab:disp)). Conviene separar la precisión relativa, es decir, la repetibilidad de las épocas medida por la dispersión, de la exactitud absoluta, que es la cercanía a la posición verdadera en el marco elegido. Si la línea base es corta, el error de la coordenada PPP de la base se traslada casi por igual a ambos rovers como un desplazamiento común, de modo que afecta a la exactitud absoluta pero no a la comparación entre receptores.
+
+Las diferencias entre las medias de ambos rovers (aproximadamente 0.19 m en latitud, 1.64 m en longitud y 1.03 m en altura) son mayores que la precisión decimétrica que suele esperarse de una solución FLOAT. Con los datos disponibles no es posible atribuirlas a una única causa. Entre las candidatas plausibles figuran la incompatibilidad de señales L2 entre la base (L2W) y el rover u-blox (L2X), que redujo la doble diferencia a L1 de GPS y GLONASS; la ausencia de correcciones APC-ARP y PCO; la distinta geometría satelital de dos colectas que no fueron simultáneas; y la corta duración de las ocupaciones. Este informe no separa cuantitativamente esos efectos.
+
+**Marco de referencia.** Conservar el ITRF/IGS moderno y su época es preferible a transformar innecesariamente a WGS84 (Transit): la coordenada PPP es coherente con la época de observación y con los productos empleados, y una transformación adicional solo añadiría incertidumbre y riesgo de error sin beneficio para el PPK [@altamimi2016; @altamimi2023; @rebischung2016].
+
+**Limitaciones.** Las ocupaciones duran unos dos minutos, con multipath propio del campus, geometría satelital variable y una configuración de RTKLIB-EX que condiciona la resolución de ambigüedades. La calidad de la coordenada PPP, que llegó con tres advertencias del servicio, y la falta de tratamiento de antena también limitan la exactitud absoluta. No se inspeccionaron los RINEX con RTKPLOT, por lo que no se descartan *cycle slips* no detectados. Además, la prueba t supone independencia entre épocas, supuesto que no se cumple con datos registrados a unos 5 Hz.
+
+**Implicaciones y trabajo futuro.** Asegurar que la base y los rovers registren las mismas señales en L2, disponer de los parámetros de antena, realizar sesiones más largas, emplear productos precisos SP3/CLK (Rapid/Final), repetir las mediciones en entornos con distinto grado de obstrucción y comparar efemérides difundidas con precisas permitiría separar mejor el efecto del receptor del efecto del entorno y del procesamiento.
+
+# Conclusiones {#sec:conclusiones}
+
+Se completó un flujo reproducible de procesamiento GNSS: conversión de las colectas a RINEX 3.04 (con UPrecise/UnicoreConverter para el rover Unicore), unión de 23 archivos horarios de la base con `cat` y `convbin`, reducción a 30 s y envío personal a CSRS-PPP. La coordenada de la base resultante está expresada en ITRF2020/IGc20, época 2026.7, con incertidumbres de ±0.002 m, ±0.003 m y ±0.010 m (95 %) en latitud, longitud y altura, y se utilizó sin transformación a WGS84 (Transit).
+
+Las soluciones PPK de los dos rovers quedaron en estado FLOAT en el 100 % de las épocas, por lo que el porcentaje FIX fue igual (0 %) y la hipótesis de que el receptor de triple frecuencia lograría más épocas fijas no pudo verificarse. Las medias difirieron en aproximadamente 0.19 m en latitud, 1.64 m en longitud y 1.03 m en altura, diferencias que los datos disponibles no permiten atribuir a una causa única.
+
+La incompatibilidad de señales L2, la ausencia de parámetros de antena y la corta duración de las ocupaciones son las limitaciones principales, y quedaron documentadas junto con el tratamiento dado a cada incidencia. Corregirlas en una nueva campaña es la vía más directa para obtener soluciones fijas comparables entre receptores.
+
+# Nota sobre el uso de IA {-}
+
+Se utilizó un asistente de IA (Claude, de Anthropic) para generar la plantilla R Markdown/bookdown, el borrador del archivo `references.bib`, las funciones auxiliares en R para leer archivos `.pos` y construir tablas, y la redacción inicial de textos.
+
+Verificaciones realizadas por el autor: se verificaron las opciones de `convbin` (v2.4.3 b34), `rnx2rtkp` (v2.4.3 b34) y GFZRNX contra la ayuda de las versiones instaladas; se revisaron las salidas numéricas contra los archivos `.pos` reales y contra el informe CSRS-PPP; se contrastaron DOIs y URLs de las referencias. Se documentó que `gfzrnx` no fue accesible desde el servidor y que se usó `cat` + `convbin` como alternativa autorizada por el enunciado.
+
+Errores o limitaciones detectados al verificar las respuestas de la IA: la IA propuso inicialmente usar `gfzrnx` para unir la base, lo cual no fue posible por el bloqueo del servidor de GFZ; se detectó también que el script de reemplazo introducía inconsistencias en el YAML, las cuales fueron verificadas y corregidas manualmente.
+
+# Referencias {-}
+
+::: {#refs}
+:::
+
+\newpage
+
+# Anexo A. Scripts reproducibles {-}
+
+Los comandos se muestran como texto y no se ejecutan al tejer este documento.
+
+## A.1 Estructura del proyecto y versiones del software {-}
+
+```bash
+mkdir -p gnss/{raw/base,raw/rover,rinex/base,rinex/rover,ppp,ppk,scripts}
+
+convbin -h 2>&1 | head -n 5      # banner y opciones de convbin
+rnx2rtkp -h 2>&1 | head -n 5     # banner y opciones de rnx2rtkp
+# gfzrnx no estuvo disponible (servidor GFZ bloqueado desde la red universitaria)
+```
+
+## A.2 Conversión a RINEX y verificación de encabezados {-}
+
+```bash
+RAW=gnss/raw/rover
+RNX=gnss/rinex/rover
+FECHA=2026/08/30
+
+# u-blox ZED-F9P (doble frecuencia)
+convbin -r ubx -v 3.04 -od -os -f 2 \
+  -o $RNX/rover_ublox.obs \
+  -n $RNX/rover_ublox.nav \
+  $RAW/rover_ublox.ubx
+
+# Unicore UM980 (triple frecuencia): el .log no pudo convertirse con RTKLIB-EX;
+# se convirtió con UPrecise/UnicoreConverter y se guardó como $RNX/rover_unicore.obs
+
+# Verificación de encabezado y primeras épocas
+for f in gnss/rinex/rover/rover_ublox.obs gnss/rinex/rover/rover_unicore.obs gnss/rinex/base/base_completa.obs; do
+  echo "=== $f"
+  grep -m1 "RINEX VERSION / TYPE" "$f"
+  grep -m1 "REC # / TYPE / VERS"  "$f"
+  grep -m1 "ANT # / TYPE"         "$f"
+  grep -m1 "INTERVAL"             "$f"
+  grep -m1 "TIME OF FIRST OBS"    "$f"
+  grep -m1 "TIME OF LAST OBS"     "$f"
+  grep    "SYS / # / OBS TYPES"   "$f"
+  grep    "SYS / PHASE SHIFT"     "$f"
+  echo "Épocas: $(grep -c '^>' "$f")"
+  awk '/END OF HEADER/{f=1; next} f' "$f" | head -n 25
+done
+```
+
+## A.3 Unión de la base, cadencia de 30 s y comprobaciones {-}
+
+```bash
+# Opción A (intentada, no disponible): gfzrnx -finp "$BASE/*.obs" -fout $PPP/base_unida_01s.obs -f
+# Opción B (usada): unir los .bin crudos y convertir el flujo con convbin
+cat gnss/raw/base/*.bin > /tmp/base_completa.bin
+convbin -r unicore -v 3.04 -od -os -f 3 \
+  -o gnss/rinex/base/base_completa.obs \
+  -n gnss/rinex/base/base_completa.nav \
+  /tmp/base_completa.bin
+
+# Reducción a 30 s (diezmado con convbin)
+convbin -r rinex -v 3.04 -ti 30 \
+  -o gnss/ppp/base_unida_30s.obs \
+  gnss/rinex/base/base_completa.obs
+
+# Comprobaciones
+BASE=gnss/rinex/base; PPP=gnss/ppp
+ls -1 gnss/raw/base/*.bin | wc -l                  # archivos horarios recibidos
+ls -lh $BASE/base_completa.obs                     # archivo unido
+grep -m1 "TIME OF FIRST OBS" $PPP/base_unida_30s.obs
+grep -m1 "TIME OF LAST OBS"  $PPP/base_unida_30s.obs
+grep '^>' $PPP/base_unida_30s.obs | head -n 1
+grep '^>' $PPP/base_unida_30s.obs | tail -n 1
+# Intervalo real entre épocas (debe dominar 30 s; un valor negativo indica cambio de día)
+grep '^>' $PPP/base_unida_30s.obs \
+  | awk '{t=$5*3600+$6*60+$7; if (NR>1) print t-p; p=t}' | sort -n | uniq -c
+ls -lh $PPP/base_unida_30s.obs
+sha256sum $PPP/base_unida_30s.obs
+```
+
+## A.4 Archivo de configuración `ppk.conf` {-}
+
+Los nombres de clave pueden variar entre versiones de RTKLIB-EX; el archivo debe contrastarse con el guardado desde RTKPOST en la versión instalada.
+
+```bash
+cat > gnss/scripts/ppk.conf <<'EOF'
+# ppk.conf - PA03 GEO-114
+pos1-posmode       =kinematic      # se sobrescribe con -p 2 / -p 3
+pos1-frequency     =l1+l2          # se sobrescribe con -f 2 / -f 3
+pos1-soltype       =forward
+pos1-elmask        =15             # elevacion minima (grados)
+pos1-dynamics      =off
+pos1-tidecorr      =off
+pos1-ionoopt       =brdc
+pos1-tropopt       =saas
+pos1-sateph        =brdc
+pos1-navsys        =45             # GPS+GLO+GAL+BDS
+pos2-armode        =fix-and-hold
+pos2-arthres       =3              # umbral de ratio
+out-solformat      =llh
+out-outhead        =on
+out-outopt         =on
+out-timesys        =gpst
+out-timeform       =hms
+out-timendec       =3
+out-degform        =deg
+out-height         =ellipsoidal
+ant1-postype       =llh            # rover: se toma del RINEX
+ant1-anttype       =               # antena del rover: no suministrada
+ant1-antdelu       =0.0            # altura no suministrada (m)
+ant2-postype       =xyz            # base: coordenada PPP propia (ITRF2020 / IGc20, epoca 2026.7)
+ant2-pos1          =2078167.0251   # X ECEF (m)
+ant2-pos2          =-5683987.2712  # Y ECEF (m)
+ant2-pos3          =2006702.5967   # Z ECEF (m)
+ant2-anttype       =               # antena de la base: no suministrada
+file-rcvantfile    =               # ANTEX: no suministrado
+EOF
+```
+
+## A.5 Procesamiento PPK {-}
+
+```bash
+CONF=gnss/scripts/ppk.conf
+OUT=gnss/ppk
+FECHA=2026/08/30
+BASE_OBS=gnss/rinex/base/base_completa.obs     # base a 1 s (misma cadencia que los rovers)
+NAV=gnss/rinex/base/base_completa.nav
+
+# u-blox (doble frecuencia): 16:27:58 - 16:29:58 GPST
+rnx2rtkp -k $CONF -p 3 -f 2 -ts $FECHA 16:27:58 -te $FECHA 16:29:58 \
+  -o $OUT/rover_ublox_fijo.pos \
+  gnss/rinex/rover/rover_ublox.obs $BASE_OBS $NAV
+rnx2rtkp -k $CONF -p 2 -f 2 -ts $FECHA 16:27:58 -te $FECHA 16:29:58 \
+  -o $OUT/rover_ublox_epocas.pos \
+  gnss/rinex/rover/rover_ublox.obs $BASE_OBS $NAV
+
+# Unicore (triple frecuencia): 16:19:29 - 16:21:29 GPST
+rnx2rtkp -k $CONF -p 3 -f 3 -ts $FECHA 16:19:29 -te $FECHA 16:21:29 \
+  -o $OUT/rover_unicore_fijo.pos \
+  gnss/rinex/rover/rover_unicore.obs $BASE_OBS $NAV
+rnx2rtkp -k $CONF -p 2 -f 3 -ts $FECHA 16:19:29 -te $FECHA 16:21:29 \
+  -o $OUT/rover_unicore_epocas.pos \
+  gnss/rinex/rover/rover_unicore.obs $BASE_OBS $NAV
+```
+
+## A.6 Script maestro {-}
+
+```bash
+#!/usr/bin/env bash
+# gnss/scripts/pa03_flujo.sh - flujo completo de la PA03
+set -euo pipefail
+
+FECHA="2026/08/30"
+RAW=gnss/raw; RNX=gnss/rinex; PPP=gnss/ppp; OUT=gnss/ppk
+CONF=gnss/scripts/ppk.conf
+BASE_OBS=$RNX/base/base_completa.obs
+NAV=$RNX/base/base_completa.nav
+
+# 1) Conversión a RINEX 3.04
+convbin -r ubx -v 3.04 -od -os -f 2 -o $RNX/rover/rover_ublox.obs -n $RNX/rover/rover_ublox.nav $RAW/rover/rover_ublox.ubx
+# El .log del Unicore se convirtió con UPrecise/UnicoreConverter (rover_unicore.obs)
+
+# 2) Unión de la base y reducción a 30 s (gfzrnx no disponible)
+cat $RAW/base/*.bin > /tmp/base_completa.bin
+convbin -r unicore -v 3.04 -od -os -f 3 -o $BASE_OBS -n $NAV /tmp/base_completa.bin
+convbin -r rinex -v 3.04 -ti 30 -o $PPP/base_unida_30s.obs $BASE_OBS
+
+# 3) Comprobaciones
+ls -1 $RAW/base/*.bin | wc -l
+grep -m1 "TIME OF FIRST OBS" $PPP/base_unida_30s.obs
+grep '^>' $PPP/base_unida_30s.obs | awk '{t=$5*3600+$6*60+$7; if (NR>1) print t-p; p=t}' | sort -n | uniq -c
+ls -lh $PPP/base_unida_30s.obs; sha256sum $PPP/base_unida_30s.obs
+
+# 4) Envío manual del archivo de 30 s a CSRS-PPP y registro de ant2-pos1..3 en ppk.conf
+#    (ITRF2020 / IGc20, época 2026.7)
+
+# 5) PPK: dos salidas por rover
+rnx2rtkp -k $CONF -p 3 -f 2 -ts $FECHA 16:27:58 -te $FECHA 16:29:58 -o $OUT/rover_ublox_fijo.pos     $RNX/rover/rover_ublox.obs   $BASE_OBS $NAV
+rnx2rtkp -k $CONF -p 2 -f 2 -ts $FECHA 16:27:58 -te $FECHA 16:29:58 -o $OUT/rover_ublox_epocas.pos   $RNX/rover/rover_ublox.obs   $BASE_OBS $NAV
+rnx2rtkp -k $CONF -p 3 -f 3 -ts $FECHA 16:19:29 -te $FECHA 16:21:29 -o $OUT/rover_unicore_fijo.pos   $RNX/rover/rover_unicore.obs $BASE_OBS $NAV
+rnx2rtkp -k $CONF -p 2 -f 3 -ts $FECHA 16:19:29 -te $FECHA 16:21:29 -o $OUT/rover_unicore_epocas.pos $RNX/rover/rover_unicore.obs $BASE_OBS $NAV
+```
+
+## A.7 Gráficos con `pos_read_violin` {-}
+
+Este código requiere conexión y los archivos `.pos` en el directorio de trabajo del servidor RStudio; no se ejecuta al tejer. El GeoPackage `ppk_fix.gpkg` puede abrirse en QGIS para la representación cartográfica.
+
+```r
+devtools::source_url(
+  paste0('https://raw.githubusercontent.com/geomorfologia-master/',
+         'datos-gnss-soluciones-fijas/refs/heads/main/R/funciones.R'))
+
+archivos_pos <- list.files(pattern = '*.pos')
+res <- pos_read_violin(archivos_pos, q_filter = 1, export = 'gpkg',
+                       export_path = "ppk_fix.gpkg",
+                       export_layer = "ppk_fix",
+                       plot_stat = "raw", stat_by = "archivo")
+res
+
+# Dispersión respecto de la media:
+res <- pos_read_violin(archivos_pos, q_filter = 1, export = 'gpkg',
+                       export_path = "ppk_fix.gpkg",
+                       export_layer = "ppk_fix",
+                       plot_stat = "z", stat_by = "archivo")
+res
+```
+
+## A.8 Funciones auxiliares en R {-}
+
+```{r funciones-aux-anexo, ref.label='funciones-aux', eval=FALSE, echo=TRUE}
+```
+
+## A.9 Información de la sesión {-}
+
+```{r sesion, echo=TRUE}
+sessionInfo()
+```

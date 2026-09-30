@@ -1,4 +1,34 @@
+# ============================================
+# Reglas del curso (heredadas del profe)
+# ============================================
 .Rproj.user
 .Rhistory
 .RData
 .Ruserdata
+
+# ============================================
+# Reglas específicas para el trabajo del estudiante
+# ============================================
+
+# Datos crudos (demasiado pesados)
+gnss/raw/
+
+# RINEX intermedios grandes (cientos de MB)
+gnss/rinex/*/*.obs
+
+# Salidas generadas por knitr
+*.knit.md
+*_files/
+PA03_GNSS.log
+
+# Backups
+*.bak
+*.pretweed
+*.viejo_server
+
+# Redundantes de rnx2rtkp
+*.pos.stat
+*_events.pos
+
+# NO se excluye el PDF (PA03_GNSS.pdf es entregable)
+# NO se excluye el RMD (PA03_GNSS.Rmd es entregable)

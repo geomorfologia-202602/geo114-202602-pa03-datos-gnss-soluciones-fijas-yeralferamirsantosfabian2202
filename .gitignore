@@ -32,3 +32,6 @@ PA03_GNSS.log
 
 # NO se excluye el PDF (PA03_GNSS.pdf es entregable)
 # NO se excluye el RMD (PA03_GNSS.Rmd es entregable)
+
+# RINEX de 30 s enviado a CSRS-PPP (regenerable con convbin -ti 30)
+gnss/ppp/*.obs

@@ -1,5 +1,5 @@
      3.04           N: GNSS NAV DATA    M: Mixed            RINEX VERSION / TYPE
-CONVBIN EX 2.5.1                        20260930 201233 UTC PGM / RUN BY / DATE 
+CONVBIN EX 2.5.1                        20261028 010959 UTC PGM / RUN BY / DATE 
 format: u-blox UBX                                          COMMENT             
 log: gnss/raw/rover/20260830-122740-ubx-nmea-data-YERAL.ubx COMMENT             
                                                             END OF HEADER       
